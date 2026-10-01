@@ -2,6 +2,9 @@
 #include <cmath>
 #include <fstream>
 #include <vector>
+#include <omp.h>
+#include <chrono>
+#include <cstdio>
 
 #include "light.hpp"
 #include "material.hpp"
@@ -140,9 +143,15 @@ void render(const std::vector<Sphere>& spheres, const std::vector<Light>& lights
     constexpr int width = 7168;
     constexpr int height = 5376;
 
+    auto t0 = std::chrono::steady_clock::now();
+
     std::vector<Vec3f> frameBuffer(width*height);
 
+    auto t1 = std::chrono::steady_clock::now();
+
     Vec3f rayOrigin(0.0f, 0.0f, 0.0f);
+
+    #pragma omp parallel for schedule(dynamic, 1)
     for(size_t j = 0; j < height; j++)
     {
         for(size_t i = 0; i < width; i++)
@@ -155,12 +164,13 @@ void render(const std::vector<Sphere>& spheres, const std::vector<Light>& lights
         }
     }
 
+    auto t2 = std::chrono::steady_clock::now();
+
     std::ofstream outFile;
     outFile.open("./out.ppm", std::ios::out | std::ios::binary);
     outFile << "P6\n";
     outFile << width << " " << height << "\n";
     outFile << "255\n";
-    
     for(size_t j = 0; j < width*height; j++)
     {
         Vec3f &c = frameBuffer[j];
@@ -172,8 +182,17 @@ void render(const std::vector<Sphere>& spheres, const std::vector<Light>& lights
             outFile << (char)(255.0f * std::max(0.0f, std::min(1.0f,frameBuffer[j][i])));
         }
     }
-    
     outFile.close();
+
+    auto t3 = std::chrono::steady_clock::now();
+
+    using ms = std::chrono::milliseconds;
+    auto alloc     = std::chrono::duration_cast<ms>(t1-t0).count();
+    auto render_ms = std::chrono::duration_cast<ms>(t2-t1).count();
+    auto write     = std::chrono::duration_cast<ms>(t3-t2).count();
+    std::fprintf(stderr, "alloc %ld ms | render %ld ms | write %ld ms | serial %ld ms (%.1f%%)\n",
+        alloc, render_ms, write, alloc + write,
+        100.0 * (alloc + write) / (alloc + render_ms + write));
 }
 
 int main()
