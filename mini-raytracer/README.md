@@ -114,30 +114,32 @@ Row 1 (`-O0`) has σ = 2.43% and triggered hyperfine's outlier warning, far abov
 
 ## Profile
 
-Two recordings of the `build-prof` binary, both single-threaded (`OMP_NUM_THREADS=1`) and pinned to core 2 so they are comparable to each other:
-
+Two recordings of the `build-prof` binary, both single-threaded (`OMP_NUM_THREADS=1`) and pinned to core 2, so they are comparable to each other:
 | | [`flame0.svg`](flame0.svg) | [`flame1.svg`](flame1.svg) |
 |---|---|---|
-| Recorded | 2026-09-29, before OpenMP | 2026-10-09, after OpenMP |
-| Samples | 26.50 G | 26.54 G |
+| Recorded | 2026-09-29, before the OpenMP change | 2026-10-09, after it |
+| Samples | 29K | 29K |
 
-Self time (`perf report --no-children --sort symbol`) is samples where that function's own instructions were executing, excluding time inside its callees. It is what's actually worth optimizing, and it is **not** what a flame graph's width shows -- widths there are inclusive.
+Numbers below are **self time** from `perf report --no-children --sort symbol`: the share of samples where that function's own instructions were running, not counting time inside the functions it called. A flame graph's bar width is the opposite, it includes everything the function called, so the two are not interchangeable and I compare self time here.
 
-| Function | flame0 self | flame1 self |
+| Function | flame0 | flame1 |
 |---|---|---|
 | `scene_intersect` | 63.72% | 63.69% |
 | `cast_ray` | 14.66% | 15.34% |
-| `render` | 6.37% | 6.29% (4.82% + 1.47% in `[clone ._omp_fn.0]`) |
+| `render` | 6.37% | 6.29% (see below) |
 
-### flame0 vs flame1
+### What changed between the two
+**Where the time goes did not change.** `scene_intersect` is still the function to optimize, at essentially the same share: 63.72% to 63.69%. The order of the top three is the same. The only code change between the two recordings was adding the OpenMP pragma on Day 3, which did not touch the ray maths, and the profile agrees.
 
-**The ordering did not change and neither did the hot path.** `scene_intersect` holds 63.72% -> 63.69% of self time, three hundredths of a point apart across two recordings ten days and one OpenMP pragma apart. `render` is 6.37% -> 6.29%, though in flame1 it is split across two symbols: OpenMP outlines the parallel region into `render(...) [clone ._omp_fn.0]`, so the loop body is compiled as its own function and 1.47% of the 6.29% is reported under that name. Self time is the right measure for this comparison because it excludes callees, so unlike the inclusive widths it does not inherit the GOMP overhead sitting above the hot path. `cast_ray` moves more than the others, 14.66% -> 15.34%; that is larger than sampling error at 29K samples, the cause is not established, and it may be attribution shifting with the outlined function. Noted rather than claimed.
+**`render` now appears under two names.** flame1 lists both `render(...)` at 4.82% and `render(...) [clone ._omp_fn.0]` at 1.47%. The suffix comes from the `#pragma omp parallel for` I added: the compiler splits the parallelised loop out into a second function so the OpenMP runtime can call it. Added together that is 6.29%, against 6.37% before, so it is the same work under two labels rather than new cost.
 
-**The one structural difference is the OpenMP runtime.** flame0 goes `render` (99.12%) -> `cast_ray` (80.22%). flame1 goes `render` (99.65%) -> `GOMP_parallel_loop_nonmonotonic_dynamic` (83.51%) -> `render` (83.37%) -> `vector<vec<float,3>>::operator[]` (79.52%) -> `cast_ray` (77.87%). Even at one thread the parallel region still dispatches through the GOMP runtime, so Day 3's pragma is visible as a frame that did not exist before. Those inclusive widths are each 2-3 points lower than their flame0 counterparts, which is that overhead taking its cut off the top rather than anything inside the hot path moving -- the self times above confirm it.
+**flame1 has a frame that flame0 does not:** `GOMP_parallel_loop_nonmonotonic_dynamic`, sitting between `render` and the loop body. This is the OpenMP runtime, and it is present even at one thread, so the pragma costs something whether or not there is anything to parallelise across. I have not measured how much, and its bar width cannot tell me, because width is inclusive and this frame contains the whole render.
 
-**There are no `malloc`, `operator new` or `free` frames in either graph, which is the expected result rather than a missing one.** The Day 4 audit found 10 allocations, all of them setup and none in the per-pixel path, so there was nothing to remove and nothing to disappear. What the profile does show in their place is `vector<vec<float,3>>::vector` at 2.79% -> 2.91%, with `asm_exc_page_fault` at 2.37% -> 2.24% underneath it: the framebuffer's cost here is the kernel faulting in and zero-filling 462 MB on first touch, not the allocator. One `malloc` call is free; touching what it returned is not. That is the same work the Threading section measures as a 164 ms serial "alloc" phase.
+**No `malloc`, `operator new` or `free` frames in either graph.** That matches the Day 4 heaptrack audit, which found 10 allocations, all at setup, none per pixel. What does show up near the framebuffer is `asm_exc_page_fault`, at 2.37% in flame0 and 2.24% in flame1. My current reading is that the cost of the 462 MB framebuffer is the kernel handing over pages the first time each one is touched, rather than the allocation call itself, which would also explain the 164 ms "alloc" phase in the Threading section. Not yet verified.
 
-One reading note: `dot`, `normalized`, `length` and `operator[]` appear as separate frames even though Compiler Explorer shows them fully inlined at `-O2`. `build-prof` carries debug info and perf expands inlined frames from it when building callchains -- confirmed, since `perf report` tags them `(inlined)` in the callchain output. The `operator[]` frame sitting above `cast_ray` is the same effect: a trivial accessor cannot call `cast_ray`, it is the `framebuffer[i] = cast_ray(...)` call site charged to the accessor inlined around it.
+### Open questions from this comparison
+- `cast_ray` self time rose 14.66% -> 15.34% while the other two stayed flat. I have no explanation. Possibly related to the loop being split out, possibly real. Logged in `gaps.md`.
+- `dot`, `normalized`, `length` and `operator[]` appear as separate frames even though Compiler Explorer showed them inlined at `-O2` (Day 3 notes). `perf report` marks them `(inlined)`, so perf is reconstructing them from the debug info in `build-prof` rather than them being real calls. How that reconstruction works, and why `operator[]` ends up listed above `cast_ray` when an array accessor obviously cannot call it, I do not know yet. Logged in `gaps.md`.
 
 ## Allocations
 Audited with `heaptrack` on both the `build-prof` binary (for the stack traces, which need debug info) and the `build` binary (to confirm the shipped build behaves the same). **10 allocations total, all of them setup; none in the per-pixel path.** No change was needed, so the before/after count is 10 -> 10.
